@@ -81,6 +81,7 @@
 #include <winsock2.h>
 #endif
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -177,6 +178,15 @@ fake_getnameinfo(const struct sockaddr *sa, size_t salen, char *host,
 #ifndef MIN
 #define MIN(a,b) (((a)<(b))?(a):(b))
 #endif
+
+/** The request obj owns the evhttp connection and needs to free it */
+#define EVHTTP_REQ_OWN_CONNECTION	0x0001
+/** The request object is owned by the user; the user must free it */
+#define EVHTTP_USER_OWNED		0x0004
+/** The request will be used again upstack; freeing must be deferred */
+#define EVHTTP_REQ_DEFER_FREE		0x0008
+/** The request should be freed upstack */
+#define EVHTTP_REQ_NEEDS_FREE		0x0010
 
 extern int debug;
 
@@ -504,8 +514,6 @@ evhttp_make_header_request(struct evhttp_connection *evcon,
 	/* NOTE: some version of GCC reports a warning that flags may be uninitialized, hence assignment */
 	ev_uint16_t flags = 0;
 
-	evhttp_remove_header(req->output_headers, "Proxy-Connection");
-
 	/* Generate request line */
 	if (!(method = evhttp_method_(evcon, req->type, &flags))) {
 		method = "NULL";
@@ -534,15 +542,10 @@ evhttp_make_header_request(struct evhttp_connection *evcon,
 static int
 evhttp_is_connection_close(int flags, struct evkeyvalq* headers)
 {
-	if (flags & EVHTTP_PROXY_REQUEST) {
-		/* proxy connection */
-		const char *connection = evhttp_find_header(headers, "Proxy-Connection");
-		return (connection == NULL || evutil_ascii_strcasecmp(connection, "keep-alive") != 0);
-	} else {
-		const char *connection = evhttp_find_header(headers, "Connection");
-		return (connection != NULL && evutil_ascii_strcasecmp(connection, "close") == 0);
-	}
+	const char *connection = evhttp_find_header(headers, "Connection");
+	return (connection != NULL && evutil_ascii_strcasecmp(connection, "close") == 0);
 }
+
 static int
 evhttp_is_request_connection_close(struct evhttp_request *req)
 {
@@ -644,9 +647,7 @@ evhttp_make_header_response(struct evhttp_connection *evcon,
 	/* if the request asked for a close, we send a close, too */
 	if (evhttp_is_connection_close(req->flags, req->input_headers)) {
 		evhttp_remove_header(req->output_headers, "Connection");
-		if (!(req->flags & EVHTTP_PROXY_REQUEST))
-		    evhttp_add_header(req->output_headers, "Connection", "close");
-		evhttp_remove_header(req->output_headers, "Proxy-Connection");
+		evhttp_add_header(req->output_headers, "Connection", "close");
 	}
 }
 
@@ -844,6 +845,9 @@ evhttp_connection_fail_(struct evhttp_connection *evcon,
 
 	bufferevent_disable(evcon->bufev, EV_READ|EV_WRITE);
 
+	error_cb = req->error_cb;
+	error_cb_arg = req->cb_arg;
+
 	if (evcon->flags & EVHTTP_CON_INCOMING) {
 		/*
 		 * for incoming requests, there are two different
@@ -855,11 +859,11 @@ evhttp_connection_fail_(struct evhttp_connection *evcon,
 		 */
 		if (evhttp_connection_incoming_fail(req, error) == -1)
 			evhttp_connection_free(evcon);
+		if (error_cb != NULL)
+			error_cb(error, error_cb_arg);
 		return;
 	}
 
-	error_cb = req->error_cb;
-	error_cb_arg = req->cb_arg;
 	/* when the request was canceled, the callback is not executed */
 	if (error != EVREQ_HTTP_REQUEST_CANCEL) {
 		/* save the callback for later; the cb might free our object */
@@ -1028,12 +1032,23 @@ evhttp_handle_chunked_read(struct evhttp_request *req, struct evbuffer *buf)
 			char *p = evbuffer_readln(buf, NULL, EVBUFFER_EOL_CRLF);
 			char *endp;
 			int error;
+			size_t len_p;
 			if (p == NULL)
 				break;
+			len_p = strlen(p);
 			/* the last chunk is on a new line? */
-			if (strlen(p) == 0) {
+			if (len_p == 0) {
 				mm_free(p);
 				continue;
+			}
+			/* strtoll(,,16) lets through whitespace, 0x, +, and - prefixes, but HTTP doesn't. */
+			error = isspace(p[0]) ||
+				p[0] == '-' ||
+				p[0] == '+' ||
+				(len_p >= 2 && p[0] == '0' && (p[1] == 'x' || p[1] == 'X'));
+			if (error) {
+				mm_free(p);
+				return (DATA_CORRUPTED);
 			}
 			ntoread = evutil_strtoll(p, &endp, 16);
 			error = (*p == '\0' ||
@@ -1156,8 +1171,11 @@ evhttp_read_body(struct evhttp_connection *evcon, struct evhttp_request *req)
 			evhttp_read_trailer(evcon, req);
 			return;
 		case DATA_CORRUPTED:
-		case DATA_TOO_LONG:
 			/* corrupted data */
+			evhttp_connection_fail_(evcon,
+			    EVREQ_HTTP_INVALID_HEADER);
+			return;
+		case DATA_TOO_LONG:
 			evhttp_connection_fail_(evcon,
 			    EVREQ_HTTP_DATA_TOO_LONG);
 			return;
@@ -1739,16 +1757,16 @@ evhttp_valid_response_code(int code)
 static int
 evhttp_parse_http_version(const char *version, struct evhttp_request *req)
 {
-	int major, minor;
+	char major, minor;
 	char ch;
-	int n = sscanf(version, "HTTP/%d.%d%c", &major, &minor, &ch);
-	if (n != 2 || major > 1) {
+	int n = sscanf(version, "HTTP/%c.%c%c", &major, &minor, &ch);
+	if (n != 2 || major > '1' || major < '0' || minor > '9' || minor < '0') {
 		event_debug(("%s: bad version %s on message %p from %s",
 			__func__, version, (void *)req, req->remote_host));
 		return (-1);
 	}
-	req->major = major;
-	req->minor = minor;
+	req->major = major - '0';
+	req->minor = minor - '0';
 	return (0);
 }
 
@@ -1797,8 +1815,6 @@ evhttp_parse_request_line(struct evhttp_request *req, char *line, size_t len)
 	char *method;
 	char *uri;
 	char *version;
-	const char *hostname;
-	const char *scheme;
 	size_t method_len;
 	enum evhttp_cmd_type type = 0;
 
@@ -2042,17 +2058,6 @@ evhttp_parse_request_line(struct evhttp_request *req, char *line, size_t len)
 		}
 	}
 
-	/* If we have an absolute-URI, check to see if it is an http request
-	   for a known vhost or server alias. If we don't know about this
-	   host, we consider it a proxy request. */
-	scheme = evhttp_uri_get_scheme(req->uri_elems);
-	hostname = evhttp_uri_get_host(req->uri_elems);
-	if (scheme && (!evutil_ascii_strcasecmp(scheme, "http") ||
-		       !evutil_ascii_strcasecmp(scheme, "https")) &&
-	    hostname &&
-	    !evhttp_find_vhost(req->evcon->http_server, NULL, hostname))
-		req->flags |= EVHTTP_PROXY_REQUEST;
-
 	return 0;
 }
 
@@ -2132,7 +2137,12 @@ evhttp_add_header(struct evkeyvalq *headers,
 {
 	event_debug(("%s: key: %s val: %s\n", __func__, key, value));
 
-	if (strchr(key, '\r') != NULL || strchr(key, '\n') != NULL) {
+	/* RFC 9110 defines field-names as case-sensitive non-empty strings made of the following characters */
+	// field-name     = 1*tchar
+	// tchar          = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~" / 0-9 / A-Z / a-z
+	/* For simplicity, we'll reject field-names containing the documented most dangerous characters */
+	// "Field values containing CR, LF, or NUL characters are invalid and dangerous, due to the varying ways that implementations might parse and interpret those characters; a recipient of CR, LF, or NUL within a field value MUST either reject the message or replace each of those characters with SP before further processing or forwarding of that message."
+	if (strchr(key, '\r') != NULL || strchr(key, '\n') != NULL || key[0] == '\0') {
 		/* drop illegal headers */
 		event_debug(("%s: dropping illegal header key\n", __func__));
 		return (-1);
@@ -2524,6 +2534,18 @@ evhttp_connection_new(const char *address, ev_uint16_t port)
 	return (evhttp_connection_base_new(NULL, NULL, address, port));
 }
 
+/* We were passed a bev with file descriptor set.
+ * Assume that this is an already-open connection that we
+ * can start sending requests on.
+ */
+static int
+evhttp_connection_set_existing_(struct evhttp_connection *evcon, struct bufferevent* bev)
+{
+	evcon->state = EVCON_IDLE;
+	evcon->flags |= EVHTTP_CON_OUTGOING;
+	return 0;
+}
+
 static struct evhttp_connection *
 evhttp_connection_new_(struct event_base *base, struct bufferevent* bev)
 {
@@ -2572,6 +2594,35 @@ evhttp_connection_new_(struct event_base *base, struct bufferevent* bev)
 
 	return (evcon);
 
+ error:
+	if (evcon != NULL)
+		evhttp_connection_free(evcon);
+	return (NULL);
+}
+
+struct evhttp_connection *
+evhttp_connection_base_bufferevent_reuse_new(struct event_base *base, struct evdns_base *dnsbase, struct bufferevent* bev)
+{
+	struct evhttp_connection *evcon = NULL;
+	if (bev == NULL)
+		goto error;
+
+	evcon = evhttp_connection_new_(base, bev);
+
+	if (evcon == NULL)
+		goto error;
+
+	if (evhttp_connection_set_existing_(evcon, bev))
+		goto error;
+
+	evcon->dns_base = dnsbase;
+	evcon->address = NULL;
+	evcon->port = 0;
+#ifndef _WIN32
+	evcon->unixsocket = NULL;
+#endif
+
+	return (evcon);
  error:
 	if (evcon != NULL)
 		evhttp_connection_free(evcon);
@@ -2986,7 +3037,7 @@ evhttp_start_read_(struct evhttp_connection *evcon)
 	    evcon);
 
 	/* If there's still data pending, process it next time through the
-	 * loop.  Don't do it now; that could get recusive. */
+	 * loop.  Don't do it now; that could get recursive. */
 	if (evbuffer_get_length(bufferevent_get_input(evcon->bufev))) {
 		event_deferred_cb_schedule_(get_deferred_queue(evcon),
 		    &evcon->read_more_deferred_cb);
@@ -4783,7 +4834,7 @@ create_bind_socket_nonblock(struct evutil_addrinfo *ai, int reuse)
 {
 	evutil_socket_t fd;
 
-	int on = 1, r;
+	int r;
 	int serrno;
 
 	/* Create listen socket */
@@ -4794,7 +4845,8 @@ create_bind_socket_nonblock(struct evutil_addrinfo *ai, int reuse)
 			return (-1);
 	}
 
-	if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (void *)&on, sizeof(on))<0)
+	/* TODO(panjf2000): make this TCP keep-alive value configurable */
+	if (evutil_set_tcp_keepalive(fd, 1, 300) < 0)
 		goto out;
 	if (reuse) {
 		if (evutil_make_listen_socket_reuseable(fd) < 0)
@@ -5366,7 +5418,7 @@ evhttp_uri_free(struct evhttp_uri *uri)
 }
 
 char *
-evhttp_uri_join(struct evhttp_uri *uri, char *buf, size_t limit)
+evhttp_uri_join(const struct evhttp_uri *uri, char *buf, size_t limit)
 {
 	struct evbuffer *tmp = 0;
 	size_t joined_size = 0;

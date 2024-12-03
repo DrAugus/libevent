@@ -2365,11 +2365,15 @@ evbuffer_read(struct evbuffer *buf, evutil_socket_t fd, int howmuch)
 				n = bytesRead;
 		}
 #else
-		n = readv(fd, vecs, nvecs);
+		/* TODO(panjf2000): wrap it with `unlikely` as compiler hint? */
+		if (nvecs == 1)
+			n = read(fd, vecs[0].IOV_PTR_FIELD, vecs[0].IOV_LEN_FIELD);
+		else
+			n = readv(fd, vecs, nvecs);
 #endif
 	}
 
-#else /*!USE_IOVEC_IMPL*/
+#else /* !USE_IOVEC_IMPL */
 	/* If we don't have FIONREAD, we might waste some space here */
 	/* XXX we _will_ waste some space here if there is any space left
 	 * over on buf->last. */
@@ -2478,7 +2482,11 @@ evbuffer_write_iovec(struct evbuffer *buffer, evutil_socket_t fd,
 			n = bytesSent;
 	}
 #else
-	n = writev(fd, iov, i);
+	/* TODO(panjf2000): wrap it with `unlikely` as compiler hint? */
+	if (i == 1)
+		n = write(fd, iov[0].IOV_PTR_FIELD, iov[0].IOV_LEN_FIELD);
+	else
+		n = writev(fd, iov, i);
 #endif
 	return (n);
 }
@@ -3003,22 +3011,10 @@ evbuffer_file_segment_new(
 	seg->file_offset = offset;
 	seg->cleanup_cb = NULL;
 	seg->cleanup_cb_arg = NULL;
-#ifdef _WIN32
-#ifndef lseek
-#define lseek _lseeki64
-#endif
-#ifndef fstat
-#define fstat _fstat
-#endif
-#ifndef stat
-#define stat _stat
-#endif
-#endif
 	if (length == -1) {
-		struct stat st;
-		if (fstat(fd, &st) < 0)
+		length = evutil_fd_filesize(fd);
+		if (length == -1)
 			goto err;
-		length = st.st_size;
 	}
 	seg->length = length;
 
@@ -3068,7 +3064,9 @@ get_page_size(void)
 static int
 evbuffer_file_segment_materialize(struct evbuffer_file_segment *seg)
 {
+#if defined(EVENT__HAVE_MMAP) || defined(_WIN32)
 	const unsigned flags = seg->flags;
+#endif
 	const int fd = seg->fd;
 	const ev_off_t length = seg->length;
 	const ev_off_t offset = seg->file_offset;
@@ -3079,6 +3077,14 @@ evbuffer_file_segment_materialize(struct evbuffer_file_segment *seg)
 #if defined(EVENT__HAVE_MMAP)
 	if (!(flags & EVBUF_FS_DISABLE_MMAP)) {
 		off_t offset_rounded = 0, offset_leftover = 0;
+		int mmap_flags =
+#ifdef MAP_NOCACHE
+			MAP_NOCACHE | /* ??? */
+#endif
+#ifdef MAP_FILE
+			MAP_FILE |
+#endif
+			MAP_PRIVATE;
 		void *mapped;
 		if (offset) {
 			/* mmap implementations don't generally like us
@@ -3094,18 +3100,11 @@ evbuffer_file_segment_materialize(struct evbuffer_file_segment *seg)
 #else
 		mapped = mmap(NULL, length + offset_leftover,
 #endif
-		    PROT_READ,
-#ifdef MAP_NOCACHE
-		    MAP_NOCACHE | /* ??? */
-#endif
-#ifdef MAP_FILE
-		    MAP_FILE |
-#endif
-		    MAP_PRIVATE,
-		    fd, offset_rounded);
+			PROT_READ, mmap_flags, fd, offset_rounded);
 		if (mapped == MAP_FAILED) {
-			event_warn("%s: mmap(%d, %d, %zu) failed",
-			    __func__, fd, 0, (size_t)(offset + length));
+			event_warn("%s: mmap(NULL, %zu, %d, %d, %d, %lld) failed", __func__,
+				(size_t)(length + offset_leftover), PROT_READ, mmap_flags, fd,
+				(long long)offset_rounded);
 		} else {
 			seg->mapping = mapped;
 			seg->contents = (char*)mapped+offset_leftover;
@@ -3138,6 +3137,11 @@ evbuffer_file_segment_materialize(struct evbuffer_file_segment *seg)
 		ev_ssize_t n = 0;
 		char *mem;
 #ifndef EVENT__HAVE_PREAD
+#ifdef _WIN32
+#ifndef lseek
+#define lseek _lseeki64
+#endif
+#endif
 		ev_off_t start_pos = lseek(fd, 0, SEEK_CUR);
 		ev_off_t pos;
 		int e;
@@ -3186,8 +3190,9 @@ evbuffer_file_segment_materialize(struct evbuffer_file_segment *seg)
 
 		seg->contents = mem;
 	}
-
+#if defined(EVENT__HAVE_MMAP) || defined(_WIN32)
 done:
+#endif
 	return 0;
 err:
 	return -1;
@@ -3228,9 +3233,9 @@ evbuffer_file_segment_free(struct evbuffer_file_segment *seg)
 	if ((seg->flags & EVBUF_FS_CLOSE_ON_FREE) && seg->fd >= 0) {
 		close(seg->fd);
 	}
-	
+
 	if (seg->cleanup_cb) {
-		(*seg->cleanup_cb)((struct evbuffer_file_segment const*)seg, 
+		(*seg->cleanup_cb)((struct evbuffer_file_segment const*)seg,
 		    seg->flags, seg->cleanup_cb_arg);
 		seg->cleanup_cb = NULL;
 		seg->cleanup_cb_arg = NULL;
@@ -3255,8 +3260,7 @@ evbuffer_add_file_segment(struct evbuffer *buf,
 	} else {
 		if (evbuffer_file_segment_materialize(seg)<0) {
 			EVLOCK_UNLOCK(seg->lock, 0);
-			EVBUFFER_UNLOCK(buf);
-			return -1;
+			goto err;
 		}
 	}
 	EVLOCK_UNLOCK(seg->lock, 0);
